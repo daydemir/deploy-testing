@@ -70,22 +70,25 @@ def analyze_api(rows):
     summary, seqs, by_route_repeats = {}, {}, {}
     for route in ordered(by_route):
         all_rows = by_route[route]
-        ok = [r for r in all_rows if r.get("status") == 200]
         groups = collections.defaultdict(list)
-        for r in ok:
+        for r in all_rows:
             groups[(r["trial"], r["size"])].append(r)
+        ok = [r for r in all_rows if r.get("status") == 200 and r.get("prompt")]
+        valid_steps = {(r["trial"], r["size"], r["step"]): r for r in ok}
         scored = []  # dicts with size, label, reuse, seconds
         for key, seq in groups.items():
             seq.sort(key=lambda r: r["step"])
-            marks, prev = [], None
+            marks = []
             for r in seq:
-                if r["label"] == "cold":
-                    marks.append(None)
-                else:
-                    q = ratio(r["cached"], r["prompt"] if r["label"].startswith("repeat") else prev)
-                    marks.append(q)
+                step = r["step"]
+                q = None
+                if (*key, step) in valid_steps and r["label"] != "cold":
+                    prev = valid_steps.get((*key, step - 1))
+                    reusable = r["prompt"] if r["label"].startswith("repeat") else (prev or {}).get("prompt")
+                    q = ratio(r["cached"], reusable)
+                marks.append(q)
+                if q is not None:
                     scored.append(dict(size=r["size"], label=r["label"], reuse=q, seconds=r["seconds"]))
-                prev = r["prompt"]
             seqs[(route, *key)] = marks
         if not ok:
             summary[route] = dict(name=name(route), requests=len(all_rows), errors=len(all_rows),
@@ -233,7 +236,7 @@ def square(x, y, size, q):
 
 def legend(y):
     out, x = "", 0
-    for c, label in [(GREEN, "reused 90%+"), (AMBER, "reused 50–90%"), (RED, "missed (under 50%)"), (PALE, "first request")]:
+    for c, label in [(GREEN, "reused 90%+"), (AMBER, "reused 50–90%"), (RED, "missed (under 50%)"), (PALE, "unscored")]:
         out += f'<rect x="{x}" y="{y - 10}" width="12" height="12" rx="2" fill="{c}"/>' + text(x + 17, y, label, 11, MUTED)
         x += 140
     return out
@@ -323,18 +326,21 @@ def main():
             w.writerow(["utc", "route", "run", "prompt_size", "step", "label", "prompt_tokens", "cached_tokens", "seconds", "x_request_id", "response_id"])
             for r in sorted(api_rows, key=lambda r: (ordered([r["route"]]), r["route"], r["trial"], list(SIZES).index(r["size"]), r["step"])):
                 if r["route"].startswith("deploy") and r.get("status") == 200:
-                    w.writerow([r["utc"], r["route"], r["trial"] + 1, r["size"], r["step"], r["label"], r["prompt"], r["cached"],
+                    w.writerow([r["utc"], r["route"], r["trial"] + 1, r["size"], r["step"], r["label"], r.get("prompt"), r.get("cached"),
                                 r["seconds"], r.get("request_id"), r.get("response_id")])
 
     working = [r for r in api if "all_warm" in api[r]]
     groups = []
     if working:
         api_chart(a.out / "api-sequences.svg", seqs, working)
-        groups.append(("Direct API", [(name(r), api[r]["all_warm"]["hit_pct"]) for r in working]))
+        reuse = [(name(r), api[r]["all_warm"]["hit_pct"]) for r in working if api[r]["all_warm"]["n"]]
+        if reuse:
+            groups.append(("Direct API", reuse))
+        medians = [(name(r), api[r]["median_seconds"]) for r in working]
+        p90s = {name(r): api[r]["p90_seconds"] for r in working}
+        scale = max(0.01, max(p90s.values()), max(v for _, v in medians))
         bar_chart(a.out / "latency.svg", "Direct API response time (median bar, 90th percentile tick), seconds",
-                  [("", [(name(r), api[r]["median_seconds"]) for r in working])],
-                  lambda label, v: f"{v:.1f}s / {next(api[r]['p90_seconds'] for r in working if name(r) == label):.1f}s",
-                  deploy_red, max(api[r]["p90_seconds"] for r in working), {name(r): api[r]["p90_seconds"] for r in working})
+                  [("", medians)], lambda label, v: f"{v:.1f}s / {p90s[label]:.1f}s", deploy_red, scale, p90s)
     if cli:
         session_chart(a.out / "cli-sessions.svg", cli_marks, "OpenCode CLI: each square is one request in a six-turn session")
         groups.append(("OpenCode CLI", [(name(r), s["hit_pct"]) for r, s in cli.items()]))
@@ -354,6 +360,9 @@ def main():
     for r, s in api.items():
         if "all_warm" not in s:
             print(f"API  {s['name']:38} no successful requests: {s['first_error']}")
+            continue
+        if not s["all_warm"]["n"]:
+            print(f"API  {s['name']:38} no requests with scorable cache reuse")
             continue
         print(f"API  {s['name']:38} reused {s['all_warm']['hit_pct']:5}%  full misses {s['all_warm']['full_misses']:3}/{s['all_warm']['n']}"
               f"  median {s['median_seconds']}s  p90 {s['p90_seconds']}s")

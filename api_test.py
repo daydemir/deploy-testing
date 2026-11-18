@@ -50,10 +50,18 @@ def run_route(route, runs, sizes, pause, out):
             request = urllib.request.Request(base + "/chat/completions", data=json.dumps(body).encode(),
                                              headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
             with urllib.request.urlopen(request, timeout=180) as resp:
-                result = json.load(resp)
+                row.update(status=resp.status, request_id=resp.headers.get("x-request-id"))
+                raw = resp.read().decode(errors="replace")
+                try:
+                    result = json.loads(raw)
+                except json.JSONDecodeError:
+                    result = {}
+                if not isinstance(result, dict):
+                    result = {}
                 usage = result.get("usage") or {}
-                row.update(status=resp.status, response_id=result.get("id"), served_by=result.get("provider"),
-                           request_id=resp.headers.get("x-request-id"), prompt=usage.get("prompt_tokens"),
+                if usage.get("prompt_tokens") is None:
+                    row["error"] = raw.replace(key, "[redacted]")[:500]
+                row.update(response_id=result.get("id"), served_by=result.get("provider"), prompt=usage.get("prompt_tokens"),
                            cached=(usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
         except urllib.error.HTTPError as e:
             row.update(status=e.code, error=e.read().decode()[:500])
